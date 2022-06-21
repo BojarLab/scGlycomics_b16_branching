@@ -1,0 +1,207 @@
+---
+title: "Single-cell Data Processing"
+author: "Rui (Ric) Qin"
+date: '2022-04-07'
+output: html_document
+---
+
+## Set working directory
+
+```{r}
+datadir <- dirname(file.choose())
+setwd(datadir)
+datadir <- paste0(datadir, "/")
+```
+
+
+## Packages and parameters
+
+```{r init}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(sctransform)
+library(DropletUtils)
+library(Matrix)
+library(glmGamPoi)
+library(ProjecTILs)
+library(Cairo)
+library(ggplot2)
+library(RColorBrewer)
+
+# Sample set name
+sample.set.name <- "TIL"
+
+# File name of the cell cycle marker gene list
+cellcycle.file <- "Cell cycle genes - Mus musculus.csv"
+
+# HTODemux function parameters
+cluster_func <- "clara"
+positive.quantile <- 0.8
+
+# Whether to write the .csv file(s) to local storage
+wfile <- FALSE
+
+# The number of decimal places to save in the final .csv table (may help reduce file size)
+# n.decimal <- FALSE, if rounding up is not desired
+n.decimal <- 3
+
+# Name of the column containing the lectin data
+lectin.col.name <- "Biotin"
+
+# Lectin name, for output
+lectin.name <- "PHA-L"
+  
+# Create a dataframe for data summary
+sc.data.summary <- as.data.frame(matrix(nrow = 1, ncol = 1))
+```
+
+
+## Initialize data
+
+```{r init}
+sc.data <- Read10X(data.dir = datadir)
+
+sc <- CreateSeuratObject(counts = sc.data[['Gene Expression']], project = "sc", min.cells = 0)
+
+sc[['HTO']] <- CreateAssayObject(counts = sc.data[['Custom']])
+
+sc[['ADT']] <- CreateAssayObject(counts = sc.data[['Antibody Capture']])
+```
+
+
+## Remove doublets
+
+```{r}
+# Normalize HTO data
+sc <- NormalizeData(sc, assay = "HTO", normalization.method = "CLR", margin = 1)
+
+# Demultiplex by hashtags
+sc <- HTODemux(sc, assay = "HTO", kfunc = cluster_func, positive.quantile = positive.quantile, verbose = TRUE)
+
+# Plot results
+HTOHeatmap(sc, assay = "HTO", ncells = 5000)
+RidgePlot(sc, assay = "HTO", features = rownames(sc[["HTO"]])[1:2], ncol = 2)
+
+# Numbers of singlet/multiplet/negative cells
+sc.class <- as.data.frame(table(sc$HTO_classification.global))
+
+# Remove negatives and doublets
+sc <- subset(x = sc, subset = HTO_classification.global == 'Singlet')
+
+sc.data.summary[["Number of all genes"]] <- dim(sc@assays$RNA)[1]
+sc.data.summary[["Number of all cells"]] <- dim(sc@assays$RNA)[2]
+sc.data.summary[c("HTODemux doublet", "HTODemux negative", "HTODemux singlet")] <- sc.class[, 2]
+sc.data.summary[, 1] <- NULL
+```
+
+
+## Transform RNA data
+
+```{r init}
+# Compute percentage contribution of mitochondrial and ribosomal genes
+sc <- PercentageFeatureSet(sc, pattern = "^mt-", col.name = "percent.mt")
+
+sc <- PercentageFeatureSet(sc, pattern = "^Rp[sl][[:digit:]]|^Rplp[[:digit:]]|^Rpsa", col.name = "percent.ribo")
+
+# Compute cell cycle scores
+cell.cycle.genes <- read.csv(file = paste0(datadir, cellcycle.file), header = TRUE, 
+                             as.is = TRUE, stringsAsFactors = FALSE)
+s.genes <- cell.cycle.genes[cell.cycle.genes$phase == "S", match("genename", colnames(cell.cycle.genes))]
+g2m.genes <- cell.cycle.genes[cell.cycle.genes$phase == "G2/M", match("genename", colnames(cell.cycle.genes))]
+sc <- CellCycleScoring(sc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+# SCTransform data
+regress.out.factors <- c("percent.mt", "percent.ribo", "S.Score", "G2M.Score")
+
+sc <- SCTransform(sc, assay = 'RNA', new.assay.name = 'SCT',
+                                vars.to.regress = regress.out.factors,
+                                variable.features.n = NULL, variable.features.rv.th = 1.3, 
+                                 method = "glmGamPoi", verbose = TRUE)
+```
+
+
+## Normalize lectin data and write to file, keeping only variable genes
+
+```{r}
+var_genes <- VariableFeatures(sc)
+sc.data.summary[["Number of variable genes"]] <- length(var_genes)
+
+sc <- NormalizeData(sc, assay = 'ADT', normalization.method = "CLR", margin = 1)
+
+final.matrix.rna <- as.data.frame(t(as.data.frame(GetAssayData(sc), 
+                                    assay = "SCT", slot = "data")[var_genes,]))
+final.matrix.adt <- as.data.frame(t(sc@assays$ADT@data))
+final.matrix.rna[lectin.name] <- as.data.frame(final.matrix.adt[lectin.col.name][[1]])
+
+if (n.decimal != 0){
+final.matrix.rna <- round(final.matrix.rna, digits = n.decimal)}
+
+```
+
+
+## Classify T cell subtypes using ProjecTIL
+
+```{r}
+# Load reference map
+ref.map <- load.reference.map()
+
+# Run projection
+query.projected <- make.projection(sc, ref=ref.map, query.assay = "RNA")
+plot.projection(ref.map, query.projected)
+
+# Classify cells
+query.projected <- cellstate.predict(ref=ref.map, query=query.projected)
+plot.statepred.composition(ref.map, query.projected, metric = "Percent")
+
+# Export cell states
+fun.cluster <- data.frame(names(Idents(query.projected)))
+colnames(fun.cluster) <- c("Cell")
+fun.cluster["Functional Cluster"] <- query.projected@meta.data[["functional.cluster"]]
+fun.cluster[[lectin.name]] <- as.data.frame(t(query.projected@assays$ADT@data))[[lectin.col.name]]
+```
+
+
+## Remove non-T cells from the final matrix identified by scGate
+
+```{r}
+filter.1 <- rownames(final.matrix.rna)%in%(fun.cluster$Cell)
+sum(as.integer(filter.1))
+
+final.matrix.rna <- final.matrix.rna[filter.1, ]
+final.matrix.adt <- final.matrix.adt[filter.1, ]
+
+final.matrix.adt["Type"] <- fun.cluster$`Functional Cluster`
+final.matrix.adt <- final.matrix.adt[, c(3,4)]
+colnames(final.matrix.adt)[1] <- lectin.name
+
+sc.data.summary[["Number of non-T cells"]] <- sum(as.integer(!filter.1))
+sc.data.summary[["Final number of cells"]] <- sum(as.integer(filter.1))
+```
+
+
+## Write to file
+
+```{r}
+if (wfile){
+  write.table(final.matrix.rna,
+          file = paste0(datadir, sample.set.name, '_transformed_data.csv'), 
+          sep = ',', row.names = T, col.names = NA, quote = F)
+  
+  write.table(final.matrix.adt,
+          file = paste0(datadir, sample.set.name, '_transformed_identity.csv'), 
+          sep = ',', row.names = T, col.names = NA, quote = F)
+  
+  write.table(sc.data.summary, file = paste0(datadir, sample.set.name, '_data_summary.csv'),
+                sep = ',', row.names = F, col.names = T, quote = F)
+}
+```
+
+
+## # Replace cell Idents
+
+```{r}
+new.ident <- query.projected@meta.data[["functional.cluster"]]
+names(new.ident) <- names(Idents(query.projected))
+Idents(query.projected) <- new.ident
+```
